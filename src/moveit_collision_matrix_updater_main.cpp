@@ -53,8 +53,8 @@ int main( int argc, char **argv )
     std::string urdf_path = argv[1];
     std::string srdf_input_path = argv[2];
 
-    unsigned int num_trials = 1000;
-    double min_fraction = 0.05;
+    unsigned int num_trials = 50000;
+    double min_fraction = 0.95;
     std::string srdf_output_path = srdf_input_path; // default: overwrite input
 
     if ( argc > 3 ) {
