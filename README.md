@@ -57,26 +57,3 @@ This tool automatically:
 2. Reinjects them into the output SRDF after updating the collision matrix
 
 This ensures your octomap filtering rules always remain intact.
-
----
-
-## Building
-
-```bash
-colcon build --packages-select moveit_collision_matrix_updater
-source install/setup.bash
-```
-
----
-
-## License
-
-MIT (or whatever your repo uses—adjust as needed)
-
----
-
-If you want, I can also generate:
-
-* a shorter README.md (bullet-list style),
-* an extended one with diagrams / usage examples,
-* or a version targeted for GitHub Pages.
