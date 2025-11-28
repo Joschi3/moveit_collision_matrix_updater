@@ -13,3 +13,6 @@ dependencies = [
 
 [project.scripts]
 moveit_collision_matrix_updater = "scripts.check_collision_matrix:main"
+
+[tool.setuptools]
+packages = ["scripts"]
