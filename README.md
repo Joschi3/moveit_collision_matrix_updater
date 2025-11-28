@@ -116,8 +116,8 @@ A `.pre-commit-hooks.yaml` entry is provided that allows to run the `check_colli
 Add a `.pre-commit-config.yaml` file like this to your repository. Make sure the `moveit_collision_matrix_updater` is build or installed and run it via `pre-commit run -a` or to run in on every commit use `pre-commit install`.
 ```yaml
 repos:
-  - repo: https://github.com/<your-org>/moveit_collision_matrix_updater
-    rev: main
+  - repo: https://github.com/Joschi3/moveit_collision_matrix_updater
+    rev: v0.1.0
     hooks:
       - id: check-moveit-collision-matrix
         always_run: true
