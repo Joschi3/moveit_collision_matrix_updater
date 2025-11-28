@@ -375,8 +375,8 @@ def run(args) -> int:
 
 def main(argv=None):
     args = parse_args(argv)
-    return run(args)
+    sys.exit(run(args))
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

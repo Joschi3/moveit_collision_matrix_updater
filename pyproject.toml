@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moveit_collision_matrix_updater"
+version = "0.1.0"
+description = "Updates the disable_collision tags in `.srdf' file."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+]
+
+[project.scripts]
+moveit_collision_matrix_updater = "scripts.check_collision_matrix:main"

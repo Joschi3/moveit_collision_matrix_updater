@@ -1,7 +1,7 @@
 - id: check-moveit-collision-matrix
   name: Check MoveIt collision matrix
   description: Validate that the MoveIt SRDF collision matrix is up-to-date.
-  entry: scripts/check_collision_matrix.py
+  entry: moveit_collision_matrix_updater
   language: python
   pass_filenames: false
   always_run: true
