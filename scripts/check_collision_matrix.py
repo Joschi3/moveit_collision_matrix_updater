@@ -268,7 +268,7 @@ def apply_collision_matrix_changes(
 # ---------------------------------------------------------------------------
 
 
-def run(args) -> int:
+def run(args, prog_name: str, original_argv) -> int:
     # Resolve packages via ament
     try:
         pkg_urdf_share = Path(get_package_share_directory(args.package_urdf))
@@ -340,9 +340,13 @@ def run(args) -> int:
                 print(f"  {a} -- {b} (reason={reason})", file=sys.stderr)
 
         if not args.fix:
+            # Build a command the user can copy-paste to auto-fix the SRDF
+            # Use the same entry point name and args, plus --fix --yes.
+            fix_cmd = " ".join([prog_name, *list(original_argv), "--fix", "--yes"])
             print(
-                "\nRun this script with --fix to update the <disable_collisions> "
-                "block in the SRDF to the regenerated, sorted version.",
+                "\nRun the following command to update the <disable_collisions> "
+                "block in the SRDF to the regenerated, sorted version:\n"
+                f"  {fix_cmd}",
                 file=sys.stderr,
             )
             return 1
@@ -374,8 +378,12 @@ def run(args) -> int:
 
 
 def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+
     args = parse_args(argv)
-    sys.exit(run(args))
+    prog_name = Path(sys.argv[0]).name or "moveit_collision_matrix_updater"
+    sys.exit(run(args, prog_name, argv))
 
 
 if __name__ == "__main__":
