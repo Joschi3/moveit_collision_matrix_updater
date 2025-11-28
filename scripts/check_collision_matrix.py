@@ -8,6 +8,9 @@ Supports:
   --package-srdf   (ROS 2 package containing the SRDF)
   --srdf-path      (relative path inside that package)
   --xacro-arg      (optional args to pass to xacro)
+  --fix            (apply changes to the original SRDF by editing only the
+                    <disable_collisions> lines)
+  -y / --yes       (skip confirmation prompt when using --fix)
 
 This allows the URDF/Xacro to live in one package,
 and the SRDF (moveit config) to live in another.
@@ -19,7 +22,9 @@ Procedure:
       ros2 run moveit_collision_matrix_updater moveit_collision_matrix_updater \
           <urdf> <srdf_in> 50000 0.95 <srdf_out>
  4. Compare <disable_collisions> entries.
- 5. Exit with status 1 if differences are found.
+ 5. If --fix is used, apply changes to the original SRDF by:
+      - replacing the <disable_collisions> block with the regenerated entries,
+        sorted alphabetically by (link1, link2, reason).
 """
 
 import argparse
@@ -68,6 +73,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=[],
         help="Additional xacro arguments, e.g. '--xacro-arg robot_variant:=athena'. "
         "Can be specified multiple times.",
+    )
+    parser.add_argument(
+        "--fix",
+        action="store_true",
+        help=(
+            "If differences are found, update the original SRDF by replacing the "
+            "block of <disable_collisions> entries with the regenerated, sorted set."
+        ),
+    )
+    parser.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="When used with --fix, apply changes without asking for confirmation.",
     )
     return parser
 
@@ -138,6 +157,112 @@ def parse_disable_collisions(srdf_path: Path):
     return entries
 
 
+def confirm(prompt: str, assume_yes: bool) -> bool:
+    """Ask user for confirmation unless assume_yes is True."""
+    if assume_yes:
+        print(f"{prompt} [y/N] (auto-yes due to --yes)")
+        return True
+
+    try:
+        answer = input(f"{prompt} [y/N]: ").strip().lower()
+    except EOFError:
+        # Non-interactive environment, treat as "no"
+        return False
+
+    return answer in ("y", "yes")
+
+
+def extract_disable_collision_block(lines):
+    """
+    Extract the contiguous block of <disable_collisions .../> lines.
+
+    Returns:
+      start_idx (int or None): index of first collision line
+      end_idx   (int or None): index of last collision line (inclusive)
+      entries   (list[str]):   the lines in that block
+
+    Assumes all <disable_collisions> lines appear in a single block.
+    """
+    start = None
+    end = None
+    entries = []
+
+    for idx, line in enumerate(lines):
+        if "<disable_collisions" in line:
+            if start is None:
+                start = idx
+            end = idx
+            entries.append(line)
+
+    return start, end, entries
+
+
+def format_collision_line(a: str, b: str, reason: str) -> str:
+    """Generate a canonical disable_collisions line with required escaping."""
+
+    def escape(link):
+        # MoveIt SRDF uses escaped octomap identifier:
+        if link == "<octomap>":
+            return "&lt;octomap&gt;"
+        return link
+
+    return (
+        f'    <disable_collisions link1="{escape(a)}" '
+        f'link2="{escape(b)}" reason="{reason}"/>'
+    )
+
+
+def apply_collision_matrix_changes(
+    srdf_original: Path,
+    srdf_generated: Path,
+    missing_entries,
+    added_entries,
+):
+    """
+    Apply collision matrix changes to the original SRDF file in a minimal way.
+
+    We take the full set of <disable_collisions> entries from the generated SRDF,
+    sort them alphabetically by (link1, link2, reason), and replace only the
+    block of <disable_collisions> lines in the original file with this sorted set.
+
+    This preserves all other content (comments, unrelated tags, etc.).
+    """
+    # Read the original SRDF
+    orig_text = srdf_original.read_text(encoding="utf-8")
+    orig_lines = orig_text.splitlines()
+
+    # Find the block of <disable_collisions> lines in the original
+    block_start, block_end, _ = extract_disable_collision_block(orig_lines)
+    if block_start is None or block_end is None:
+        print(
+            "[ERROR] No <disable_collisions> block found in original SRDF. "
+            "Cannot apply changes safely.",
+            file=sys.stderr,
+        )
+        return
+
+    # Parse the final (regenerated) set of collision entries
+    updated_entries = parse_disable_collisions(srdf_generated)
+
+    # Build sorted collision lines from updated entries
+    sorted_lines = [
+        format_collision_line(a, b, reason)
+        for (a, b, reason) in sorted(updated_entries)
+    ]
+
+    # Construct the new file content:
+    # - everything before the original block
+    # - the new sorted block
+    # - everything after the original block
+    new_lines = []
+    new_lines.extend(orig_lines[:block_start])
+    new_lines.extend(sorted_lines)
+    new_lines.extend(orig_lines[block_end + 1 :])
+
+    srdf_original.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    print(f"[OK] Collision matrix updated and sorted in {srdf_original}")
+
+
 # ---------------------------------------------------------------------------
 # Main core logic
 # ---------------------------------------------------------------------------
@@ -200,21 +325,52 @@ def run(args) -> int:
 
         if missing:
             print(
-                "\nMissing entries (in SRDF, but not in regenerated):", file=sys.stderr
+                "\nMissing entries (in SRDF, but not in regenerated):",
+                file=sys.stderr,
             )
             for a, b, reason in sorted(missing):
                 print(f"  {a} -- {b} (reason={reason})", file=sys.stderr)
 
         if added:
-            print("\nNew entries (regenerated but not in SRDF):", file=sys.stderr)
+            print(
+                "\nNew entries (regenerated but not in SRDF):",
+                file=sys.stderr,
+            )
             for a, b, reason in sorted(added):
                 print(f"  {a} -- {b} (reason={reason})", file=sys.stderr)
 
-        print(
-            "\nPlease regenerate the SRDF or update your manual entries.",
-            file=sys.stderr,
+        if not args.fix:
+            print(
+                "\nRun this script with --fix to update the <disable_collisions> "
+                "block in the SRDF to the regenerated, sorted version.",
+                file=sys.stderr,
+            )
+            return 1
+
+        # Fix mode: ask for confirmation (unless --yes)
+        prompt = (
+            f"\nApply regenerated collision matrix to original SRDF by "
+            f"replacing and sorting the <disable_collisions> block?\n  {srdf_input}"
         )
-        return 1
+        if not confirm(prompt, assume_yes=args.yes):
+            print("\nAborting; SRDF was NOT modified.", file=sys.stderr)
+            return 1
+
+        try:
+            apply_collision_matrix_changes(
+                srdf_original=srdf_input,
+                srdf_generated=srdf_tmp_out,
+                missing_entries=missing,
+                added_entries=added,
+            )
+        except Exception as e:
+            print(
+                f"[ERROR] Failed to apply changes to SRDF {srdf_input}: {e}",
+                file=sys.stderr,
+            )
+            return 1
+
+        return 0
 
 
 def main(argv=None):
