@@ -131,7 +131,7 @@ def run_collision_updater(urdf_path: Path, srdf_in: Path, srdf_out: Path):
         "moveit_collision_matrix_updater",
         str(urdf_path),
         str(srdf_in),
-        "50000",
+        "200000",
         "0.95",
         str(srdf_out),
     ]
