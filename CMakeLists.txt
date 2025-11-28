@@ -19,30 +19,30 @@ find_package(urdf REQUIRED)
 find_package(moveit_setup_framework REQUIRED)
 find_package(moveit_setup_srdf_plugins REQUIRED)
 
-add_executable(moveit_collision_matrix_updater src/moveit_collision_matrix_updater.cpp src/moveit_collision_matrix_updater_main.cpp)
+add_executable(
+  moveit_collision_matrix_updater src/moveit_collision_matrix_updater.cpp
+                                  src/moveit_collision_matrix_updater_main.cpp)
 
-target_include_directories(moveit_collision_matrix_updater PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include>
-)
+target_include_directories(
+  moveit_collision_matrix_updater
+  PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+         $<INSTALL_INTERFACE:include>)
 
-ament_target_dependencies(moveit_collision_matrix_updater
+ament_target_dependencies(
+  moveit_collision_matrix_updater
   rclcpp
   std_msgs
   moveit_core
   srdfdom
   urdf
   moveit_setup_framework
-  moveit_setup_srdf_plugins
-)
+  moveit_setup_srdf_plugins)
 
-install(TARGETS moveit_collision_matrix_updater
-  DESTINATION lib/${PROJECT_NAME}
-)
+install(TARGETS moveit_collision_matrix_updater DESTINATION lib/${PROJECT_NAME})
 
-install(DIRECTORY config launch
+install(
+  DIRECTORY config launch
   DESTINATION share/${PROJECT_NAME}
-  OPTIONAL
-)
+  OPTIONAL)
 
 ament_package()

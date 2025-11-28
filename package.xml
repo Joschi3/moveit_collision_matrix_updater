@@ -1,4 +1,4 @@
-<?xml version="1.0"?>
+<?xml version='1.0' encoding='UTF-8'?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>moveit_collision_matrix_updater</name>
@@ -10,8 +10,13 @@
   <author email="aljoscha.schmidt@tu-darmstadt.de">Aljoscha Schmidt</author>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>moveit_core</depend>
+  <depend>moveit_setup_framework</depend>
+  <depend>moveit_setup_srdf_plugins</depend>
   <depend>rclcpp</depend>
+  <depend>srdfdom</depend>
   <depend>std_msgs</depend>
+  <depend>urdf</depend>
 
   <export>
     <build_type>ament_cmake</build_type>
