@@ -9,6 +9,7 @@ description = "Updates the disable_collision tags in `.srdf' file."
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
+    "ros-ament-index-python"
 ]
 
 [project.scripts]
