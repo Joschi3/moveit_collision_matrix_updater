@@ -95,14 +95,39 @@ collectNamedPoseCollisions( const std::shared_ptr<moveit_setup::SRDFConfig> &srd
 /**
  * @brief Merge named-pose collisions into the SRDF's disabled-collisions set.
  *
- * Precedence: Adjacent > NamedPose > other reasons. A pair already disabled
- * with reason "Adjacent" is left untouched; any other existing reason is
- * overwritten to "NamedPose". Pairs not yet disabled are appended.
+ * Precedence: Adjacent > User > NamedPose > other reasons. Pairs already
+ * disabled with reason "Adjacent", "User", or "NamedPose" are left untouched;
+ * any other existing reason is overwritten to "NamedPose". Pairs not yet
+ * disabled are appended.
  *
  * @return Number of pairs that were newly disabled (excluding relabels).
  */
 unsigned int mergeNamedPoseCollisions( const std::shared_ptr<moveit_setup::SRDFConfig> &srdf_config,
                                        const std::vector<NamedPoseCollision> &collisions );
+
+/**
+ * @brief Snapshot user-authored <disable_collisions> entries (reason="User").
+ *
+ * Octomap entries are skipped — they are preserved separately. Pairs whose
+ * link1 or link2 is not present in the robot model are dropped with a warning
+ * (stale references should not survive a regeneration).
+ *
+ * Call this BEFORE updateCollisionMatrix() (which clears the disabled set).
+ */
+std::vector<srdf::Model::CollisionPair>
+extractUserCollisions( const std::shared_ptr<moveit_setup::SRDFConfig> &srdf_config );
+
+/**
+ * @brief Re-merge previously-snapshotted user pairs into the disabled set.
+ *
+ * Precedence: Adjacent > User > everything else. A pair already disabled with
+ * reason "Adjacent" is left as Adjacent (adjacency is structural). Any other
+ * existing reason is relabeled to "User". Pairs not present are appended.
+ *
+ * @return Number of pairs that were newly added (excluding relabels).
+ */
+unsigned int restoreUserCollisions( const std::shared_ptr<moveit_setup::SRDFConfig> &srdf_config,
+                                    const std::vector<srdf::Model::CollisionPair> &user_pairs );
 
 } // namespace collision_matrix_updater
 

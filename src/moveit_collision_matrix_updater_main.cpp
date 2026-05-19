@@ -169,12 +169,18 @@ int main( int argc, char **argv )
       }
     }
 
+    // Snapshot user-defined collision pairs so the regeneration does not wipe them.
+    auto user_collisions = collision_matrix_updater::extractUserCollisions( srdf_config );
+
     // Initialize collision updater
     auto *collision_updater = collision_matrix_updater::initializeCollisionUpdater( data_warehouse );
 
     // Recalculate collision matrix
     collision_matrix_updater::updateCollisionMatrix( collision_updater, srdf_config, num_trials,
                                                      min_fraction );
+
+    // Restore user-defined pairs (precedence over generated reasons except Adjacent).
+    collision_matrix_updater::restoreUserCollisions( srdf_config, user_collisions );
 
     // Optionally scan named <group_state> poses for additional collisions
     if ( run_named_pose_check ) {

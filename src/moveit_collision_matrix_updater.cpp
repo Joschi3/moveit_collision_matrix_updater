@@ -216,7 +216,8 @@ unsigned int mergeNamedPoseCollisions( const std::shared_ptr<SRDFConfig> &srdf_c
       ++newly_added;
     } else {
       auto &cp = disabled[it->second];
-      if ( cp.reason_ == "Adjacent" || cp.reason_ == "NamedPose" )
+      // Precedence: Adjacent > User > NamedPose > others. Never demote.
+      if ( cp.reason_ == "Adjacent" || cp.reason_ == "User" || cp.reason_ == "NamedPose" )
         continue;
       cp.reason_ = "NamedPose";
     }
@@ -225,6 +226,89 @@ unsigned int mergeNamedPoseCollisions( const std::shared_ptr<SRDFConfig> &srdf_c
   RCLCPP_INFO_STREAM( logger, "Named-pose merge: " << newly_added << " new pair(s) disabled, "
                                                    << unique_pairs.size() - newly_added
                                                    << " existing pair(s) relabeled or kept." );
+  return newly_added;
+}
+
+std::vector<srdf::Model::CollisionPair>
+extractUserCollisions( const std::shared_ptr<SRDFConfig> &srdf_config )
+{
+  auto logger = rclcpp::get_logger( "collision_matrix_updater" );
+  auto robot_model = srdf_config->getRobotModel();
+  const auto &disabled = srdf_config->getDisabledCollisions();
+
+  std::vector<srdf::Model::CollisionPair> kept;
+  unsigned int dropped = 0;
+  for ( const auto &pair : disabled ) {
+    if ( pair.reason_ != "User" )
+      continue;
+    if ( pair.link1_ == "<octomap>" || pair.link2_ == "<octomap>" )
+      continue;
+    if ( !robot_model || !robot_model->hasLinkModel( pair.link1_ ) ||
+         !robot_model->hasLinkModel( pair.link2_ ) ) {
+      RCLCPP_WARN_STREAM( logger, "Dropping stale user collision pair (link not in model): "
+                                      << pair.link1_ << " - " << pair.link2_ );
+      ++dropped;
+      continue;
+    }
+    kept.push_back( pair );
+  }
+  RCLCPP_INFO_STREAM( logger, "Preserving "
+                                  << kept.size() << " user-defined collision pair(s)"
+                                  << ( dropped ? std::string( " (" ) + std::to_string( dropped ) +
+                                                     " dropped as stale)"
+                                               : std::string() ) );
+  return kept;
+}
+
+unsigned int restoreUserCollisions( const std::shared_ptr<SRDFConfig> &srdf_config,
+                                    const std::vector<srdf::Model::CollisionPair> &user_pairs )
+{
+  if ( user_pairs.empty() )
+    return 0;
+
+  auto logger = rclcpp::get_logger( "collision_matrix_updater" );
+  auto &disabled = srdf_config->getDisabledCollisions();
+
+  auto sorted_key = []( std::string a, std::string b ) {
+    if ( a > b )
+      std::swap( a, b );
+    return std::make_pair( std::move( a ), std::move( b ) );
+  };
+  std::map<std::pair<std::string, std::string>, std::size_t> existing;
+  for ( std::size_t i = 0; i < disabled.size(); ++i ) {
+    existing.emplace( sorted_key( disabled[i].link1_, disabled[i].link2_ ), i );
+  }
+
+  unsigned int newly_added = 0;
+  unsigned int relabeled = 0;
+  for ( const auto &user_pair : user_pairs ) {
+    auto key = sorted_key( user_pair.link1_, user_pair.link2_ );
+    auto it = existing.find( key );
+    if ( it == existing.end() ) {
+      srdf::Model::CollisionPair cp;
+      cp.link1_ = key.first;
+      cp.link2_ = key.second;
+      cp.reason_ = "User";
+      disabled.push_back( cp );
+      ++newly_added;
+    } else {
+      auto &cp = disabled[it->second];
+      if ( cp.reason_ == "Adjacent" )
+        continue;
+      if ( cp.reason_ == "NamedPose" ) {
+        RCLCPP_WARN_STREAM( logger, "User pair "
+                                        << cp.link1_ << " - " << cp.link2_
+                                        << " also collides in a named pose; keeping reason=User "
+                                           "(your explicit choice overrides NamedPose)." );
+      }
+      if ( cp.reason_ != "User" ) {
+        cp.reason_ = "User";
+        ++relabeled;
+      }
+    }
+  }
+  RCLCPP_INFO_STREAM( logger, "User-pair restore: " << newly_added << " added, " << relabeled
+                                                    << " relabeled." );
   return newly_added;
 }
 
