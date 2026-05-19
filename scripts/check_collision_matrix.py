@@ -120,6 +120,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "(default: 1, i.e. sequential)"
         ),
     )
+    parser.add_argument(
+        "--named-poses",
+        default=None,
+        help=(
+            "Also scan SRDF <group_state> poses for collisions. Pass 'all' or a "
+            "comma-separated list of pose names (e.g. 'folded,front'). Pairs "
+            "colliding in any listed pose are added to <disable_collisions> with "
+            "reason='NamedPose'. Default: skip this check."
+        ),
+    )
     return parser
 
 
@@ -156,7 +166,11 @@ def generate_urdf_from_xacro(xacro_path: Path, xacro_args, out_path: Path):
 
 
 def run_collision_updater(
-    urdf_path: Path, srdf_in: Path, srdf_out: Path, num_samples: int
+    urdf_path: Path,
+    srdf_in: Path,
+    srdf_out: Path,
+    num_samples: int,
+    named_poses: str | None = None,
 ):
     cmd = [
         "ros2",
@@ -169,6 +183,8 @@ def run_collision_updater(
         "0.95",
         str(srdf_out),
     ]
+    if named_poses:
+        cmd.append(f"--check-named-poses={named_poses}")
     run_cmd(cmd)
 
 
@@ -377,7 +393,11 @@ def run(args, prog_name: str, original_argv) -> int:
                 f"[INFO] Running collision matrix updater (run {i + 1}/{num_runs})..."
             )
             run_collision_updater(
-                urdf_path, srdf_tmp_in, srdf_tmp_out, args.num_samples
+                urdf_path,
+                srdf_tmp_in,
+                srdf_tmp_out,
+                args.num_samples,
+                named_poses=args.named_poses,
             )
             result = parse_disable_collisions(srdf_tmp_out)
             print(f"[INFO]   Run {i + 1}: {len(result)} disable_collisions entries")
@@ -429,6 +449,17 @@ def run(args, prog_name: str, original_argv) -> int:
             )
             for a, b in sorted(added):
                 print(f"  {a} -- {b} (reason={updated[(a, b)]})", file=sys.stderr)
+
+            named_pose_added = [
+                (a, b) for (a, b) in added if updated[(a, b)] == "NamedPose"
+            ]
+            if named_pose_added:
+                print(
+                    f"\n[WARN] {len(named_pose_added)} additional collision(s) "
+                    f"detected from named <group_state> poses (reason=NamedPose). "
+                    f"These pairs collide in poses the robot will be commanded into.",
+                    file=sys.stderr,
+                )
 
         if not args.fix:
             # Build a command the user can copy-paste to auto-fix the SRDF
