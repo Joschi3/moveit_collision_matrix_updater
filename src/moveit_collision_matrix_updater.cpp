@@ -176,6 +176,9 @@ collectNamedPoseCollisions( const std::shared_ptr<SRDFConfig> &srdf_config,
       std::string b = link_pair.second;
       if ( a > b )
         std::swap( a, b );
+      // Machine-readable line for downstream parsers (Python wrapper, CI logs).
+      // Format: NAMED_POSE_HIT <pose_name> <link1> <link2>
+      RCLCPP_INFO_STREAM( logger, "NAMED_POSE_HIT " << gs.name_ << " " << a << " " << b );
       results.push_back( { a, b, gs.name_ } );
     }
   }
