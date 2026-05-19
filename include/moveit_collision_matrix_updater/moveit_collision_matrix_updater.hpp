@@ -15,6 +15,7 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <rclcpp/rclcpp.hpp>
 
@@ -27,6 +28,12 @@
 
 namespace collision_matrix_updater
 {
+
+struct NamedPoseCollision {
+  std::string link1;
+  std::string link2;
+  std::string pose_name;
+};
 
 /**
  * @brief Initialize the DataWarehouse with URDF and SRDF configurations
@@ -65,6 +72,62 @@ void updateCollisionMatrix( moveit_setup::srdf_setup::DefaultCollisions *collisi
  */
 void writeSRDFFile( const std::shared_ptr<moveit_setup::SRDFConfig> &srdf_config,
                     const std::string &output_path );
+
+/**
+ * @brief Scan named poses (SRDF <group_state>) and collect colliding link pairs.
+ *
+ * For each group_state matching the filter, sets a RobotState to that pose
+ * (joints not listed default to the model's default values, mirroring upstream
+ * MoveIt's "default pose" rule) and runs a self-collision check via the
+ * PlanningScene already configured by the SRDF.
+ *
+ * @param srdf_config SRDF configuration providing the robot model, planning
+ *                    scene, and group states.
+ * @param pose_filter Names of <group_state>s to check. Empty means "all".
+ * @throws std::runtime_error if pose_filter contains a name not present in the SRDF.
+ * @return Colliding pairs across all matching poses (may contain duplicates
+ *         across poses; caller deduplicates).
+ */
+std::vector<NamedPoseCollision>
+collectNamedPoseCollisions( const std::shared_ptr<moveit_setup::SRDFConfig> &srdf_config,
+                            const std::vector<std::string> &pose_filter );
+
+/**
+ * @brief Merge named-pose collisions into the SRDF's disabled-collisions set.
+ *
+ * Precedence: Adjacent > User > NamedPose > other reasons. Pairs already
+ * disabled with reason "Adjacent", "User", or "NamedPose" are left untouched;
+ * any other existing reason is overwritten to "NamedPose". Pairs not yet
+ * disabled are appended.
+ *
+ * @return Number of pairs that were newly disabled (excluding relabels).
+ */
+unsigned int mergeNamedPoseCollisions( const std::shared_ptr<moveit_setup::SRDFConfig> &srdf_config,
+                                       const std::vector<NamedPoseCollision> &collisions );
+
+/**
+ * @brief Snapshot user-authored <disable_collisions> entries (reason="User").
+ *
+ * Octomap entries are skipped — they are preserved separately. Pairs whose
+ * link1 or link2 is not present in the robot model are dropped with a warning
+ * (stale references should not survive a regeneration).
+ *
+ * Call this BEFORE updateCollisionMatrix() (which clears the disabled set).
+ */
+std::vector<srdf::Model::CollisionPair>
+extractUserCollisions( const std::shared_ptr<moveit_setup::SRDFConfig> &srdf_config );
+
+/**
+ * @brief Re-merge previously-snapshotted user pairs into the disabled set.
+ *
+ * Precedence: Adjacent > User > everything else. A pair already disabled with
+ * reason "Adjacent" is left as Adjacent (adjacency is structural). Any other
+ * existing reason is relabeled to "User". Pairs not present are appended.
+ *
+ * @return Number of pairs that were newly added (excluding relabels).
+ */
+unsigned int restoreUserCollisions( const std::shared_ptr<moveit_setup::SRDFConfig> &srdf_config,
+                                    const std::vector<srdf::Model::CollisionPair> &user_pairs );
 
 } // namespace collision_matrix_updater
 

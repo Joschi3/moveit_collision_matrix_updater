@@ -34,6 +34,8 @@ It is designed for:
 * Reads URDF and SRDF directly from disk
 * Supports an optional **output SRDF path**
 * Preserves special octomap collision entries (`&lt;octomap&gt;`)
+* Preserves user-defined entries (`reason="User"`); stale references are dropped
+* Optionally scans `<group_state>` poses and disables pairs that collide there
 * Works in headless environments (Docker, CI, build servers)
 
 ---
@@ -42,25 +44,49 @@ It is designed for:
 
 ```bash
 ros2 run moveit_collision_matrix_updater moveit_collision_matrix_updater \
-    <urdf_file> <srdf_file> [num_trials] [min_fraction] [output_srdf_file]
+    <urdf_file> <srdf_file> [num_trials] [min_fraction] [output_srdf_file] \
+    [--check-named-poses=all|name1,name2,...]
 ```
 
 ### Arguments
 
-| Argument           | Description                                              | Default       |
-| ------------------ | -------------------------------------------------------- | ------------- |
-| `urdf_file`        | Path to the URDF file                                    | —             |
-| `srdf_file`        | Path to the input SRDF file                              | —             |
-| `num_trials`       | Number of random samples used for collision detection    | `50000`       |
-| `min_fraction`     | Minimum fraction of collisions before disabling the pair | `0.95`        |
-| `output_srdf_file` | Output path (if omitted, SRDF is overwritten)            | same as input |
+| Argument                | Description                                                                                                  | Default       |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------ | ------------- |
+| `urdf_file`             | Path to the URDF file                                                                                        | —             |
+| `srdf_file`             | Path to the input SRDF file                                                                                  | —             |
+| `num_trials`            | Number of random samples used for collision detection                                                        | `50000`       |
+| `min_fraction`          | Minimum fraction of collisions before disabling the pair                                                     | `0.95`        |
+| `output_srdf_file`      | Output path (if omitted, SRDF is overwritten)                                                                | same as input |
+| `--check-named-poses`   | Scan SRDF `<group_state>` poses and disable colliding pairs with `reason="NamedPose"`. `all` or a CSV list.  | off           |
 
 ### Example
 
 ```bash
 ros2 run moveit_collision_matrix_updater moveit_collision_matrix_updater \
-    athena.urdf athena.srdf 50000 0.95 athena_updated.srdf
+    athena.urdf athena.srdf 50000 0.95 athena_updated.srdf \
+    --check-named-poses=all
 ```
+
+---
+
+## Reasons and precedence
+
+Each `<disable_collisions>` entry carries a `reason` attribute. The updater
+respects the following precedence — higher-precedence reasons are never
+overwritten by lower-precedence ones during regeneration:
+
+| Reason        | Meaning                                                                                  |
+| ------------- | ---------------------------------------------------------------------------------------- |
+| `Adjacent`    | Links connected by a joint in the URDF. Structural; cannot be overridden.                |
+| `User`        | Manually authored. Snapshotted before regeneration and restored afterwards.              |
+| `NamedPose`   | Pair collides in at least one `<group_state>` (only emitted with `--check-named-poses`). |
+| `Default`     | Pair collides in the robot's default (all-zeros / limit-midpoint) pose.                  |
+| `Always`      | Pair collides in ≥ `min_fraction` of random samples.                                     |
+| `Never`       | Pair never collides across `num_trials` random samples.                                  |
+
+Precedence (highest → lowest): `Adjacent > User > NamedPose > Default/Always/Never`.
+A `User` pair whose links no longer exist in the URDF is dropped with a warning
+on the next run.
 
 ---
 
@@ -75,13 +101,16 @@ It is intended for pre-commit hooks and CI sanity checks.
 * Resolves URDF/Xacro and SRDF via `ament_index_python`
 * Accepts additional `--xacro-arg` parameters
 * Generates temporary URDF if input is `.xacro`
-* Runs the C++ collision updater internally
+* Runs the C++ collision updater **N times** and keeps only the
+  intersection of all runs — eliminates borderline pairs that flip due
+  to stochastic sampling
+* Optionally forwards a named-pose scan to the C++ updater
 * Compares `<disable_collisions>` entries between original and regenerated SRDF
 * Works non-destructively by default
 * Supports `--fix` and `--yes` to patch the SRDF in-place
 * Preserves formatting, comments, order of all other SRDF elements
 * Alphabetically sorts the regenerated collision matrix block
-* Preserves octomap entries (`&lt;octomap&gt;`)
+* Preserves octomap entries (`&lt;octomap&gt;`) and user-defined entries
 
 ---
 
@@ -94,21 +123,30 @@ python3 scripts/check_collision_matrix.py \
   --package-srdf my_robot_moveit_config \
   --srdf-path config/robot.srdf \
   --xacro-arg robot_variant:=athena \
+  --named-poses all \
   --fix \
   -y
 ```
 
 ### Flags
 
-| Flag           | Meaning                                                  |
-| -------------- | -------------------------------------------------------- |
-| `--fix`        | Update only the `<disable_collisions>` lines of the SRDF |
-| `--yes` / `-y` | Non-interactive mode                                     |
-| `--xacro-arg`  | Extra xacro arguments, repeatable                        |
+| Flag             | Meaning                                                                                                | Default |
+| ---------------- | ------------------------------------------------------------------------------------------------------ | ------- |
+| `--fix`          | Update only the `<disable_collisions>` lines of the SRDF                                               | off     |
+| `--yes` / `-y`   | Non-interactive mode                                                                                   | off     |
+| `--xacro-arg`    | Extra xacro arguments, repeatable                                                                      | —       |
+| `--num-runs`     | Number of times to run the C++ updater. Intersection across runs is kept (consensus).                  | `3`     |
+| `--num-samples`  | Random samples per run (forwarded as `num_trials`)                                                     | `500000`|
+| `--jobs`         | Run up to N updater invocations in parallel                                                            | `1`     |
+| `--named-poses`  | Scan `<group_state>` poses for collisions. Pass `all` or a CSV list. Adds entries as `reason=NamedPose`. | off     |
 
+When `--named-poses` finds additional pairs that aren't yet in the SRDF, the
+checker prints a `[WARN]` line and requires `--fix --yes` (or interactive
+confirmation) before modifying the SRDF.
 
+---
 
-# 4. Pre-Commit Hook
+# 3. Pre-Commit Hook
 
 A `.pre-commit-hooks.yaml` entry is provided that allows to run the `check_collision_matrix.py` script on every commit.
 
@@ -133,4 +171,8 @@ repos:
           - config/athena.srdf
           - --xacro-arg
           - robot_name:=athena
+          # Optional: also check that all named poses are collision-free
+          # (or otherwise disabled). Adds reason="NamedPose" entries.
+          - --named-poses
+          - all
 ```

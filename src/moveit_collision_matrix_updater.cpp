@@ -4,7 +4,9 @@
 
 #include <moveit_collision_matrix_updater/moveit_collision_matrix_updater.hpp>
 
+#include <algorithm>
 #include <stdexcept>
+#include <unordered_set>
 
 #include <rclcpp/rclcpp.hpp>
 
@@ -15,6 +17,11 @@
 
 // Collision Computation
 #include <moveit_setup_srdf_plugins/default_collisions.hpp>
+
+// Self-collision check for named-pose scanning
+#include <moveit/collision_detection/collision_common.hpp>
+#include <moveit/planning_scene/planning_scene.hpp>
+#include <moveit/robot_state/robot_state.hpp>
 
 namespace collision_matrix_updater
 {
@@ -97,6 +104,212 @@ void writeSRDFFile( const std::shared_ptr<SRDFConfig> &srdf_config, const std::s
   }
 
   RCLCPP_INFO_STREAM( logger, "SRDF file written to: " << output_path );
+}
+
+std::vector<NamedPoseCollision>
+collectNamedPoseCollisions( const std::shared_ptr<SRDFConfig> &srdf_config,
+                            const std::vector<std::string> &pose_filter )
+{
+  auto logger = rclcpp::get_logger( "collision_matrix_updater" );
+
+  const auto &group_states = srdf_config->getGroupStates();
+  if ( group_states.empty() ) {
+    RCLCPP_WARN( logger, "No <group_state> entries found in SRDF; named-pose check is a no-op." );
+    return {};
+  }
+
+  // Resolve which poses to scan. Empty filter == all.
+  std::unordered_set<std::string> available;
+  available.reserve( group_states.size() );
+  for ( const auto &gs : group_states ) available.insert( gs.name_ );
+
+  for ( const auto &requested : pose_filter ) {
+    if ( available.find( requested ) == available.end() ) {
+      throw std::runtime_error( "Named pose not found in SRDF <group_state>: '" + requested + "'" );
+    }
+  }
+  const bool all_poses = pose_filter.empty();
+  std::unordered_set<std::string> filter_set( pose_filter.begin(), pose_filter.end() );
+
+  // Build a fresh PlanningScene from the (already-updated) robot model so the
+  // ACM reflects the current <disable_collisions>. Pairs already disabled will
+  // be filtered out by the ACM; we only see *new* colliding pairs.
+  auto robot_model = srdf_config->getRobotModel();
+  if ( !robot_model ) {
+    throw std::runtime_error( "SRDFConfig has no robot model; cannot run named-pose check." );
+  }
+  auto planning_scene = std::make_shared<planning_scene::PlanningScene>( robot_model );
+
+  collision_detection::CollisionRequest req;
+  req.contacts = true;
+  req.max_contacts = 1000;
+  req.max_contacts_per_pair = 1;
+
+  std::vector<NamedPoseCollision> results;
+
+  for ( const auto &gs : group_states ) {
+    if ( !all_poses && filter_set.find( gs.name_ ) == filter_set.end() )
+      continue;
+
+    moveit::core::RobotState state( robot_model );
+    state.setToDefaultValues();
+
+    for ( const auto &[joint_name, values] : gs.joint_values_ ) {
+      if ( !robot_model->hasJointModel( joint_name ) ) {
+        RCLCPP_WARN_STREAM( logger, "Pose '" << gs.name_ << "': joint '" << joint_name
+                                             << "' not in robot model; skipping joint." );
+        continue;
+      }
+      state.setJointPositions( joint_name, values );
+    }
+    state.update();
+
+    collision_detection::CollisionResult res;
+    planning_scene->checkSelfCollision( req, res, state );
+
+    RCLCPP_INFO_STREAM( logger, "Pose '" << gs.name_ << "' (group '" << gs.group_
+                                         << "'): " << res.contacts.size() << " colliding pair(s)" );
+
+    for ( const auto &[link_pair, contacts] : res.contacts ) {
+      (void)contacts;
+      std::string a = link_pair.first;
+      std::string b = link_pair.second;
+      if ( a > b )
+        std::swap( a, b );
+      results.push_back( { a, b, gs.name_ } );
+    }
+  }
+
+  return results;
+}
+
+unsigned int mergeNamedPoseCollisions( const std::shared_ptr<SRDFConfig> &srdf_config,
+                                       const std::vector<NamedPoseCollision> &collisions )
+{
+  auto logger = rclcpp::get_logger( "collision_matrix_updater" );
+  auto &disabled = srdf_config->getDisabledCollisions();
+
+  // Build a lookup of currently-disabled pairs -> index in the vector.
+  auto sorted_key = []( std::string a, std::string b ) {
+    if ( a > b )
+      std::swap( a, b );
+    return std::make_pair( std::move( a ), std::move( b ) );
+  };
+  std::map<std::pair<std::string, std::string>, std::size_t> existing;
+  for ( std::size_t i = 0; i < disabled.size(); ++i ) {
+    existing.emplace( sorted_key( disabled[i].link1_, disabled[i].link2_ ), i );
+  }
+
+  // Deduplicate the incoming list (a pair may collide in multiple poses).
+  std::set<std::pair<std::string, std::string>> unique_pairs;
+  for ( const auto &c : collisions ) unique_pairs.emplace( sorted_key( c.link1, c.link2 ) );
+
+  unsigned int newly_added = 0;
+  for ( const auto &pair : unique_pairs ) {
+    auto it = existing.find( pair );
+    if ( it == existing.end() ) {
+      srdf::Model::CollisionPair cp;
+      cp.link1_ = pair.first;
+      cp.link2_ = pair.second;
+      cp.reason_ = "NamedPose";
+      disabled.push_back( cp );
+      ++newly_added;
+    } else {
+      auto &cp = disabled[it->second];
+      // Precedence: Adjacent > User > NamedPose > others. Never demote.
+      if ( cp.reason_ == "Adjacent" || cp.reason_ == "User" || cp.reason_ == "NamedPose" )
+        continue;
+      cp.reason_ = "NamedPose";
+    }
+  }
+
+  RCLCPP_INFO_STREAM( logger, "Named-pose merge: " << newly_added << " new pair(s) disabled, "
+                                                   << unique_pairs.size() - newly_added
+                                                   << " existing pair(s) relabeled or kept." );
+  return newly_added;
+}
+
+std::vector<srdf::Model::CollisionPair>
+extractUserCollisions( const std::shared_ptr<SRDFConfig> &srdf_config )
+{
+  auto logger = rclcpp::get_logger( "collision_matrix_updater" );
+  auto robot_model = srdf_config->getRobotModel();
+  const auto &disabled = srdf_config->getDisabledCollisions();
+
+  std::vector<srdf::Model::CollisionPair> kept;
+  unsigned int dropped = 0;
+  for ( const auto &pair : disabled ) {
+    if ( pair.reason_ != "User" )
+      continue;
+    if ( pair.link1_ == "<octomap>" || pair.link2_ == "<octomap>" )
+      continue;
+    if ( !robot_model || !robot_model->hasLinkModel( pair.link1_ ) ||
+         !robot_model->hasLinkModel( pair.link2_ ) ) {
+      RCLCPP_WARN_STREAM( logger, "Dropping stale user collision pair (link not in model): "
+                                      << pair.link1_ << " - " << pair.link2_ );
+      ++dropped;
+      continue;
+    }
+    kept.push_back( pair );
+  }
+  RCLCPP_INFO_STREAM( logger, "Preserving "
+                                  << kept.size() << " user-defined collision pair(s)"
+                                  << ( dropped ? std::string( " (" ) + std::to_string( dropped ) +
+                                                     " dropped as stale)"
+                                               : std::string() ) );
+  return kept;
+}
+
+unsigned int restoreUserCollisions( const std::shared_ptr<SRDFConfig> &srdf_config,
+                                    const std::vector<srdf::Model::CollisionPair> &user_pairs )
+{
+  if ( user_pairs.empty() )
+    return 0;
+
+  auto logger = rclcpp::get_logger( "collision_matrix_updater" );
+  auto &disabled = srdf_config->getDisabledCollisions();
+
+  auto sorted_key = []( std::string a, std::string b ) {
+    if ( a > b )
+      std::swap( a, b );
+    return std::make_pair( std::move( a ), std::move( b ) );
+  };
+  std::map<std::pair<std::string, std::string>, std::size_t> existing;
+  for ( std::size_t i = 0; i < disabled.size(); ++i ) {
+    existing.emplace( sorted_key( disabled[i].link1_, disabled[i].link2_ ), i );
+  }
+
+  unsigned int newly_added = 0;
+  unsigned int relabeled = 0;
+  for ( const auto &user_pair : user_pairs ) {
+    auto key = sorted_key( user_pair.link1_, user_pair.link2_ );
+    auto it = existing.find( key );
+    if ( it == existing.end() ) {
+      srdf::Model::CollisionPair cp;
+      cp.link1_ = key.first;
+      cp.link2_ = key.second;
+      cp.reason_ = "User";
+      disabled.push_back( cp );
+      ++newly_added;
+    } else {
+      auto &cp = disabled[it->second];
+      if ( cp.reason_ == "Adjacent" )
+        continue;
+      if ( cp.reason_ == "NamedPose" ) {
+        RCLCPP_WARN_STREAM( logger, "User pair "
+                                        << cp.link1_ << " - " << cp.link2_
+                                        << " also collides in a named pose; keeping reason=User "
+                                           "(your explicit choice overrides NamedPose)." );
+      }
+      if ( cp.reason_ != "User" ) {
+        cp.reason_ = "User";
+        ++relabeled;
+      }
+    }
+  }
+  RCLCPP_INFO_STREAM( logger, "User-pair restore: " << newly_added << " added, " << relabeled
+                                                    << " relabeled." );
+  return newly_added;
 }
 
 } // namespace collision_matrix_updater
