@@ -18,13 +18,18 @@ and the SRDF (moveit config) to live in another.
 Procedure:
  1. Resolve URDF and SRDF package paths via ament_index_python.
  2. Generate temporary URDF if input is .xacro.
- 3. Run the C++ collision updater:
+ 3. Run the C++ collision updater N times (default 3), optionally in parallel:
       ros2 run moveit_collision_matrix_updater moveit_collision_matrix_updater \
-          <urdf> <srdf_in> 50000 0.95 <srdf_out>
- 4. Compare <disable_collisions> entries.
- 5. If --fix is used, apply changes to the original SRDF by:
-      - replacing the <disable_collisions> block with the regenerated entries,
-        sorted alphabetically by (link1, link2, reason).
+          <urdf> <srdf_in> <num_samples> 0.95 <srdf_out>
+ 4. Compute the intersection of all runs' <disable_collisions> pairs. A pair
+    is kept only if it appears in every run; the emitted reason is the most
+    common reason across runs (ties broken lexicographically). This
+    eliminates borderline pairs that appear inconsistently due to stochastic
+    sampling, while ignoring noise in the reason field.
+ 5. Compare the consensus pairs with the original SRDF pairs.
+ 6. If --fix is used, apply changes to the original SRDF by:
+      - replacing the <disable_collisions> block with the consensus entries,
+        sorted alphabetically by (link1, link2).
 """
 
 import argparse
@@ -32,6 +37,8 @@ import subprocess
 import sys
 import tempfile
 import shutil
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
@@ -79,7 +86,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "If differences are found, update the original SRDF by replacing the "
-            "block of <disable_collisions> entries with the regenerated, sorted set."
+            "block of <disable_collisions> entries with the consensus, sorted set."
         ),
     )
     parser.add_argument(
@@ -87,6 +94,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--yes",
         action="store_true",
         help="When used with --fix, apply changes without asking for confirmation.",
+    )
+    parser.add_argument(
+        "--num-runs",
+        type=int,
+        default=3,
+        help=(
+            "Number of times to run the collision updater. The intersection "
+            "of all runs is used as the canonical set, eliminating borderline "
+            "pairs that appear inconsistently. (default: 3)"
+        ),
+    )
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=500000,
+        help="Number of random samples per collision updater run. (default: 500000)",
+    )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help=(
+            "Number of collision updater runs to execute in parallel. "
+            "(default: 1, i.e. sequential)"
+        ),
     )
     return parser
 
@@ -123,7 +155,9 @@ def generate_urdf_from_xacro(xacro_path: Path, xacro_args, out_path: Path):
     run_cmd(cmd)
 
 
-def run_collision_updater(urdf_path: Path, srdf_in: Path, srdf_out: Path):
+def run_collision_updater(
+    urdf_path: Path, srdf_in: Path, srdf_out: Path, num_samples: int
+):
     cmd = [
         "ros2",
         "run",
@@ -131,18 +165,22 @@ def run_collision_updater(urdf_path: Path, srdf_in: Path, srdf_out: Path):
         "moveit_collision_matrix_updater",
         str(urdf_path),
         str(srdf_in),
-        "500000",
+        str(num_samples),
         "0.95",
         str(srdf_out),
     ]
     run_cmd(cmd)
 
 
-def parse_disable_collisions(srdf_path: Path):
-    """Return set of (link1, link2, reason) where link1/link2 are sorted."""
+def parse_disable_collisions(srdf_path: Path) -> dict:
+    """Return dict mapping (link1, link2) -> reason, where link1/link2 are sorted.
+
+    The pair (link1, link2) is the identity; reason is metadata that may vary
+    across stochastic runs of the updater.
+    """
     tree = ET.parse(srdf_path)
     root = tree.getroot()
-    entries = set()
+    entries: dict = {}
 
     for elem in root.iter():
         if elem.tag.endswith("disable_collisions"):
@@ -152,9 +190,29 @@ def parse_disable_collisions(srdf_path: Path):
 
             if link1 and link2:
                 a, b = sorted([link1, link2])
-                entries.add((a, b, reason))
+                entries[(a, b)] = reason
 
     return entries
+
+
+def compute_consensus(runs: list[dict]) -> dict:
+    """Return the consensus mapping of pair -> reason across all runs.
+
+    A pair is included only if it appears in every run (set intersection on
+    pairs). The chosen reason is the most common reason seen across the runs
+    that contained the pair; ties are broken by lexicographic order.
+    """
+    pair_sets = [set(run.keys()) for run in runs]
+    common_pairs = set.intersection(*pair_sets)
+
+    consensus: dict = {}
+    for pair in common_pairs:
+        reasons = [run[pair] for run in runs]
+        counts = Counter(reasons)
+        top_count = max(counts.values())
+        candidates = sorted(r for r, c in counts.items() if c == top_count)
+        consensus[pair] = candidates[0]
+    return consensus
 
 
 def confirm(prompt: str, assume_yes: bool) -> bool:
@@ -214,16 +272,14 @@ def format_collision_line(a: str, b: str, reason: str) -> str:
 
 def apply_collision_matrix_changes(
     srdf_original: Path,
-    srdf_generated: Path,
-    missing_entries,
-    added_entries,
+    updated_entries: dict,
 ):
     """
     Apply collision matrix changes to the original SRDF file in a minimal way.
 
-    We take the full set of <disable_collisions> entries from the generated SRDF,
-    sort them alphabetically by (link1, link2, reason), and replace only the
-    block of <disable_collisions> lines in the original file with this sorted set.
+    We take the provided mapping of (link1, link2) -> reason, sort by pair,
+    and replace only the block of <disable_collisions> lines in the original
+    file with this sorted set.
 
     This preserves all other content (comments, unrelated tags, etc.).
     """
@@ -241,13 +297,10 @@ def apply_collision_matrix_changes(
         )
         return
 
-    # Parse the final (regenerated) set of collision entries
-    updated_entries = parse_disable_collisions(srdf_generated)
-
     # Build sorted collision lines from updated entries
     sorted_lines = [
-        format_collision_line(a, b, reason)
-        for (a, b, reason) in sorted(updated_entries)
+        format_collision_line(a, b, updated_entries[(a, b)])
+        for (a, b) in sorted(updated_entries.keys())
     ]
 
     # Construct the new file content:
@@ -279,6 +332,16 @@ def run(args, prog_name: str, original_argv) -> int:
         )
         return 1
 
+    if args.num_runs < 1:
+        print("[ERROR] --num-runs must be >= 1", file=sys.stderr)
+        return 1
+    if args.num_samples < 1:
+        print("[ERROR] --num-samples must be >= 1", file=sys.stderr)
+        return 1
+    if args.jobs < 1:
+        print("[ERROR] --jobs must be >= 1", file=sys.stderr)
+        return 1
+
     urdf_or_xacro = (pkg_urdf_share / args.urdf_path).resolve()
     srdf_input = (pkg_srdf_share / args.srdf_path).resolve()
 
@@ -300,22 +363,50 @@ def run(args, prog_name: str, original_argv) -> int:
         else:
             urdf_path = urdf_or_xacro
 
-        # Prepare SRDF temp copies
+        # Prepare SRDF temp input
         srdf_tmp_in = tmpdir / "input.srdf"
-        srdf_tmp_out = tmpdir / "updated.srdf"
         shutil.copy2(srdf_input, srdf_tmp_in)
 
-        # Run collision updater
-        print("[INFO] Running collision matrix updater...")
-        run_collision_updater(urdf_path, srdf_tmp_in, srdf_tmp_out)
+        # Run collision updater N times (optionally in parallel) and collect results
+        num_runs = args.num_runs
+        jobs = min(args.jobs, num_runs)
 
-        # Compare disable_collisions
+        def do_run(i: int) -> dict:
+            srdf_tmp_out = tmpdir / f"updated_{i}.srdf"
+            print(
+                f"[INFO] Running collision matrix updater (run {i + 1}/{num_runs})..."
+            )
+            run_collision_updater(
+                urdf_path, srdf_tmp_in, srdf_tmp_out, args.num_samples
+            )
+            result = parse_disable_collisions(srdf_tmp_out)
+            print(f"[INFO]   Run {i + 1}: {len(result)} disable_collisions entries")
+            return result
+
+        if jobs == 1:
+            all_results = [do_run(i) for i in range(num_runs)]
+        else:
+            print(f"[INFO] Running {num_runs} runs with up to {jobs} in parallel.")
+            with ThreadPoolExecutor(max_workers=jobs) as pool:
+                all_results = list(pool.map(do_run, range(num_runs)))
+
+        # Compute consensus (intersection of all runs, by pair)
+        updated = compute_consensus(all_results)
+        union_size = len(set().union(*(r.keys() for r in all_results)))
+        print(
+            f"[INFO] Consensus: {len(updated)} pairs in intersection "
+            f"(out of {union_size} in union across {num_runs} run(s), "
+            f"{union_size - len(updated)} borderline pairs eliminated)"
+        )
+
+        # Compare disable_collisions (by pair; reason is metadata)
         print("[INFO] Comparing SRDF collision entries...")
         original = parse_disable_collisions(srdf_tmp_in)
-        updated = parse_disable_collisions(srdf_tmp_out)
 
-        missing = original - updated
-        added = updated - original
+        original_pairs = set(original.keys())
+        updated_pairs = set(updated.keys())
+        missing = original_pairs - updated_pairs
+        added = updated_pairs - original_pairs
 
         if not missing and not added:
             print("[OK] Collision matrix is up to date.")
@@ -328,16 +419,16 @@ def run(args, prog_name: str, original_argv) -> int:
                 "\nMissing entries (in SRDF, but not in regenerated):",
                 file=sys.stderr,
             )
-            for a, b, reason in sorted(missing):
-                print(f"  {a} -- {b} (reason={reason})", file=sys.stderr)
+            for a, b in sorted(missing):
+                print(f"  {a} -- {b} (reason={original[(a, b)]})", file=sys.stderr)
 
         if added:
             print(
                 "\nNew entries (regenerated but not in SRDF):",
                 file=sys.stderr,
             )
-            for a, b, reason in sorted(added):
-                print(f"  {a} -- {b} (reason={reason})", file=sys.stderr)
+            for a, b in sorted(added):
+                print(f"  {a} -- {b} (reason={updated[(a, b)]})", file=sys.stderr)
 
         if not args.fix:
             # Build a command the user can copy-paste to auto-fix the SRDF
@@ -363,9 +454,7 @@ def run(args, prog_name: str, original_argv) -> int:
         try:
             apply_collision_matrix_changes(
                 srdf_original=srdf_input,
-                srdf_generated=srdf_tmp_out,
-                missing_entries=missing,
-                added_entries=added,
+                updated_entries=updated,
             )
         except Exception as e:
             print(
