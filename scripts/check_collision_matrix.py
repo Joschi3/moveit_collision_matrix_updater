@@ -33,6 +33,7 @@ Procedure:
 """
 
 import argparse
+import re
 import subprocess
 import sys
 import tempfile
@@ -171,7 +172,7 @@ def run_collision_updater(
     srdf_out: Path,
     num_samples: int,
     named_poses: str | None = None,
-):
+) -> tuple[str, str]:
     cmd = [
         "ros2",
         "run",
@@ -185,7 +186,31 @@ def run_collision_updater(
     ]
     if named_poses:
         cmd.append(f"--check-named-poses={named_poses}")
-    run_cmd(cmd)
+    return run_cmd(cmd)
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def parse_named_pose_hits(stderr: str) -> dict[tuple[str, str], list[str]]:
+    """Parse NAMED_POSE_HIT marker lines emitted by the C++ binary.
+
+    Returns a dict mapping (link1, link2) -> sorted list of pose names where
+    the pair was observed in collision.
+    """
+    hits: dict[tuple[str, str], set[str]] = {}
+    for raw in stderr.splitlines():
+        line = _ANSI_RE.sub("", raw)
+        idx = line.find("NAMED_POSE_HIT")
+        if idx < 0:
+            continue
+        parts = line[idx:].split()
+        if len(parts) < 4:
+            continue
+        _, pose, link1, link2 = parts[0], parts[1], parts[2], parts[3]
+        a, b = sorted([link1, link2])
+        hits.setdefault((a, b), set()).add(pose)
+    return {pair: sorted(poses) for pair, poses in hits.items()}
 
 
 def parse_disable_collisions(srdf_path: Path) -> dict:
@@ -387,12 +412,13 @@ def run(args, prog_name: str, original_argv) -> int:
         num_runs = args.num_runs
         jobs = min(args.jobs, num_runs)
 
-        def do_run(i: int) -> dict:
+        def do_run(i: int) -> tuple[dict, dict]:
+            """Return (disable_collisions_dict, named_pose_hits_dict)."""
             srdf_tmp_out = tmpdir / f"updated_{i}.srdf"
             print(
                 f"[INFO] Running collision matrix updater (run {i + 1}/{num_runs})..."
             )
-            run_collision_updater(
+            _, stderr = run_collision_updater(
                 urdf_path,
                 srdf_tmp_in,
                 srdf_tmp_out,
@@ -400,15 +426,20 @@ def run(args, prog_name: str, original_argv) -> int:
                 named_poses=args.named_poses,
             )
             result = parse_disable_collisions(srdf_tmp_out)
+            hits = parse_named_pose_hits(stderr) if args.named_poses else {}
             print(f"[INFO]   Run {i + 1}: {len(result)} disable_collisions entries")
-            return result
+            return result, hits
 
         if jobs == 1:
-            all_results = [do_run(i) for i in range(num_runs)]
+            all_pairs = [do_run(i) for i in range(num_runs)]
         else:
             print(f"[INFO] Running {num_runs} runs with up to {jobs} in parallel.")
             with ThreadPoolExecutor(max_workers=jobs) as pool:
-                all_results = list(pool.map(do_run, range(num_runs)))
+                all_pairs = list(pool.map(do_run, range(num_runs)))
+
+        all_results = [r for r, _ in all_pairs]
+        # Named-pose hits are deterministic across runs; take run 0.
+        named_pose_hits = all_pairs[0][1] if all_pairs else {}
 
         # Compute consensus (intersection of all runs, by pair)
         updated = compute_consensus(all_results)
@@ -455,11 +486,14 @@ def run(args, prog_name: str, original_argv) -> int:
             ]
             if named_pose_added:
                 print(
-                    f"\n[WARN] {len(named_pose_added)} additional collision(s) "
-                    f"detected from named <group_state> poses (reason=NamedPose). "
-                    f"These pairs collide in poses the robot will be commanded into.",
+                    f"\n[WARN] Named-pose scan flagged {len(named_pose_added)} pair(s) "
+                    f"not yet disabled (reason=NamedPose):",
                     file=sys.stderr,
                 )
+                for a, b in sorted(named_pose_added):
+                    poses = named_pose_hits.get((a, b), [])
+                    in_poses = f" (in pose: {', '.join(poses)})" if poses else ""
+                    print(f"  {a} -- {b}{in_poses}", file=sys.stderr)
 
         if not args.fix:
             # Build a command the user can copy-paste to auto-fix the SRDF
